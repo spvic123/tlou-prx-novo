@@ -69,7 +69,6 @@ jobs:
           FSELF=$(find /opt/OpenOrbis -name "create-fself" -type f | head -n 1)
           if [ -z "$FSELF" ]; then
             echo "ERRO: create-fself nao encontrado!"
-            find /opt/OpenOrbis -maxdepth 4
             exit 1
           fi
           BIN_DIR=$(dirname "$FSELF")
@@ -87,28 +86,47 @@ jobs:
       - name: Build Only TLOU PRX
         run: |
           git clone --depth 1 --recursive https://github.com/GoldHEN/GoldHEN_Plugins_SDK.git sdk
-          SAMPLE_DIR=$(find sdk -mindepth 2 -maxdepth 4 -type d -name "source" -printf "%h\n" | head -n 1)
-          echo "Using plugin dir: $SAMPLE_DIR"
-          rm -f "$SAMPLE_DIR/source/"*.cpp "$SAMPLE_DIR/source/"*.c
+          make -C sdk
+          SUB_MK=$(find sdk -mindepth 2 -name "Makefile" | head -n 1)
+          if [ -z "$SUB_MK" ]; then
+            echo "Nenhum Makefile de exemplo encontrado!"
+            find sdk -maxdepth 3
+            exit 1
+          fi
+          SAMPLE_DIR=$(dirname "$SUB_MK")
+          echo "Compilando dentro de: $SAMPLE_DIR"
+          TARGET_CPP=$(find "$SAMPLE_DIR" -name "*.cpp" | head -n 1)
+          if [ -z "$TARGET_CPP" ]; then
+            TARGET_CPP="$SAMPLE_DIR/source/main.cpp"
+            mkdir -p "$SAMPLE_DIR/source"
+          fi
           if [ -f "main.cpp" ]; then
-            cp main.cpp "$SAMPLE_DIR/source/main.cpp"
+            cp main.cpp "$TARGET_CPP"
           else
-            cp .github/workflows/main.cpp "$SAMPLE_DIR/source/main.cpp"
+            cp .github/workflows/main.cpp "$TARGET_CPP"
+          fi
+          sed -i 's/void Notify(/void PadNotify(/g; s/Notify(/PadNotify(/g' "$TARGET_CPP"
+          if ! grep -q "NotifyStatic" sdk/include/*.h; then
+            sed -i 's/NotifyStatic(buf)/Notify("%s", buf)/g' "$TARGET_CPP"
           fi
           if ! grep -q "lScePad" "$SAMPLE_DIR/Makefile"; then
             sed -i 's/-lkernel/-lkernel -lScePad/g' "$SAMPLE_DIR/Makefile"
           fi
-          make -C sdk || true
           make -C "$SAMPLE_DIR"
           mkdir -p output
           PRX_FILE=$(find "$SAMPLE_DIR" -name "*.prx" | head -n 1)
           if [ -z "$PRX_FILE" ]; then
-            PRX_FILE=$(find sdk -name "*.prx" | head -n 1)
+            echo "Arquivo .prx nao gerado!"
+            ls -la "$SAMPLE_DIR"
+            exit 1
           fi
           cp "$PRX_FILE" output/tlou_mod.prx
 
       - name: Upload PRX
         uses: actions/upload-artifact@v4
+        with:
+          name: tlou_mod_prx
+          path: output/tlou_mod.prxartifact@v4
         with:
           name: tlou_mod_prx
           path: output/tlou_mod.prx
