@@ -22,60 +22,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           sudo mkdir -p /opt/OpenOrbis
-          python3 - << 'EOF'
-          import os, json, urllib.request, subprocess
-
-          req = urllib.request.Request(
-              "https://api.github.com/repos/OpenOrbis/OpenOrbis-PS4-Toolchain/releases",
-              headers={
-                  "User-Agent": "GitHubActions",
-                  "Authorization": f"Bearer {os.environ['GH_TOKEN']}"
-              }
-          )
-          with urllib.request.urlopen(req) as resp:
-              releases = json.loads(resp.read().decode())
-
-          chosen = None
-          for rel in releases:
-              assets = rel.get("assets", [])
-              for a in assets:
-                  n = a["name"].lower()
-                  if "linux" in n and n.endswith((".tar.gz", ".tgz", ".zip")):
-                      chosen = a
-                      break
-              if not chosen:
-                  for a in assets:
-                      n = a["name"].lower()
-                      if not any(x in n for x in ("win", "mac", "osx", "darwin")) and n.endswith((".tar.gz", ".tgz", ".zip")):
-                          chosen = a
-                          break
-              if chosen:
-                  break
-
-          if not chosen:
-              raise RuntimeError("Nenhum asset Linux encontrado!")
-
-          url = chosen["browser_download_url"]
-          name = chosen["name"]
-          print(f"Downloading {name}...")
-          subprocess.run(["curl", "-fSL", "--retry", "3", url, "-o", f"/tmp/{name}"], check=True)
-          if name.endswith(".zip"):
-              subprocess.run(["sudo", "unzip", "-q", f"/tmp/{name}", "-d", "/opt/OpenOrbis"], check=True)
-          else:
-              subprocess.run(["sudo", "tar", "-xzf", f"/tmp/{name}", "-C", "/opt/OpenOrbis"], check=True)
-          os.remove(f"/tmp/{name}")
-          EOF
-
+          python3 -c 'import os,json,urllib.request,subprocess; req=urllib.request.Request("https://api.github.com/repos/OpenOrbis/OpenOrbis-PS4-Toolchain/releases",headers={"User-Agent":"GA","Authorization":"Bearer "+os.environ["GH_TOKEN"]}); rels=json.loads(urllib.request.urlopen(req).read()); assets=[a for r in rels for a in r.get("assets",[]) if a["name"].lower().endswith((".tar.gz",".tgz",".zip"))]; linux=[a for a in assets if "linux" in a["name"].lower()] or [a for a in assets if not any(x in a["name"].lower() for x in ("win","mac","osx","darwin"))]; a=linux[0]; p="/tmp/"+a["name"]; subprocess.run(["curl","-fSL","--retry","3",a["browser_download_url"],"-o",p],check=True); subprocess.run(["sudo","unzip","-q",p,"-d","/opt/OpenOrbis"] if p.endswith(".zip") else ["sudo","tar","-xzf",p,"-C","/opt/OpenOrbis"],check=True); os.remove(p)'
           FSELF=$(find /opt/OpenOrbis -name "create-fself" -type f | head -n 1)
-          if [ -z "$FSELF" ]; then
-            echo "ERRO: create-fself nao encontrado!"
-            exit 1
-          fi
           BIN_DIR=$(dirname "$FSELF")
           ROOT_DIR=$(dirname "$BIN_DIR")
-          if [ ! -d "$ROOT_DIR/include" ]; then
-            ROOT_DIR=$(dirname "$ROOT_DIR")
-          fi
+          [ ! -d "$ROOT_DIR/include" ] && ROOT_DIR=$(dirname "$ROOT_DIR")
           if [ "$BIN_DIR" != "$ROOT_DIR/bin" ]; then
             sudo mkdir -p "$ROOT_DIR/bin"
             sudo cp -f "$BIN_DIR"/* "$ROOT_DIR/bin/"
@@ -88,13 +39,7 @@ jobs:
           git clone --depth 1 --recursive https://github.com/GoldHEN/GoldHEN_Plugins_SDK.git sdk
           make -C sdk
           SUB_MK=$(find sdk -mindepth 2 -name "Makefile" | head -n 1)
-          if [ -z "$SUB_MK" ]; then
-            echo "Nenhum Makefile de exemplo encontrado!"
-            find sdk -maxdepth 3
-            exit 1
-          fi
           SAMPLE_DIR=$(dirname "$SUB_MK")
-          echo "Compilando dentro de: $SAMPLE_DIR"
           TARGET_CPP=$(find "$SAMPLE_DIR" -name "*.cpp" | head -n 1)
           if [ -z "$TARGET_CPP" ]; then
             TARGET_CPP="$SAMPLE_DIR/source/main.cpp"
@@ -106,27 +51,14 @@ jobs:
             cp .github/workflows/main.cpp "$TARGET_CPP"
           fi
           sed -i 's/void Notify(/void PadNotify(/g; s/Notify(/PadNotify(/g' "$TARGET_CPP"
-          if ! grep -q "NotifyStatic" sdk/include/*.h; then
-            sed -i 's/NotifyStatic(buf)/Notify("%s", buf)/g' "$TARGET_CPP"
-          fi
-          if ! grep -q "lScePad" "$SAMPLE_DIR/Makefile"; then
-            sed -i 's/-lkernel/-lkernel -lScePad/g' "$SAMPLE_DIR/Makefile"
-          fi
+          sed -i 's/-lkernel/-lkernel -lScePad/g; s/-lGoldHEN_Hook/-lGoldHEN_Hook -lScePad/g' "$SAMPLE_DIR/Makefile"
           make -C "$SAMPLE_DIR"
           mkdir -p output
           PRX_FILE=$(find "$SAMPLE_DIR" -name "*.prx" | head -n 1)
-          if [ -z "$PRX_FILE" ]; then
-            echo "Arquivo .prx nao gerado!"
-            ls -la "$SAMPLE_DIR"
-            exit 1
-          fi
           cp "$PRX_FILE" output/tlou_mod.prx
 
       - name: Upload PRX
         uses: actions/upload-artifact@v4
-        with:
-          name: tlou_mod_prx
-          path: output/tlou_mod.prxartifact@v4
         with:
           name: tlou_mod_prx
           path: output/tlou_mod.prx
