@@ -36,7 +36,11 @@ jobs:
           KEEP_NAME=$(basename "$KEEP_DIR")
           find sdk/plugin_src -mindepth 1 -maxdepth 1 -type d ! -name "$KEEP_NAME" -exec rm -rf {} +
           rm -f "$KEEP_DIR/source/"*.cpp
-          cp main.cpp "$KEEP_DIR/source/main.cpp"
+          if [ -f "main.cpp" ]; then
+            cp main.cpp "$KEEP_DIR/source/main.cpp"
+          else
+            cp .github/workflows/main.cpp "$KEEP_DIR/source/main.cpp"
+          fi
           if ! grep -q "lScePad" "$KEEP_DIR/Makefile"; then
             sed -i 's/-lkernel/-lkernel -lScePad/g' "$KEEP_DIR/Makefile"
           fi
