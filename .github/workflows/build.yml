@@ -39,14 +39,40 @@ jobs:
           git clone --depth 1 --recursive https://github.com/GoldHEN/GoldHEN_Plugins_SDK.git sdk
           make -C sdk
           mkdir -p build_mod output
-          echo 'extern "C" int sceSysUtilSendSystemNotificationWithText(int messageType, const char* message);' > build_mod/main.cpp
-          if [ -f "main.cpp" ]; then
-            cat main.cpp >> build_mod/main.cpp
-          else
-            cat .github/workflows/main.cpp >> build_mod/main.cpp
-          fi
-          sed -i 's/void Notify(/void PadNotify(/g; s/Notify(/PadNotify(/g; s/NotifyStatic(buf);/sceSysUtilSendSystemNotificationWithText(222, buf);/g' build_mod/main.cpp
-          clang++ --target=x86_64-pc-freebsd12-elf -fPIC -funwind-tables -fno-exceptions -fno-rtti -c             -isysroot "$OO_PS4_TOOLCHAIN"             -isystem "$OO_PS4_TOOLCHAIN/include"             -isystem "$OO_PS4_TOOLCHAIN/include/c++/v1"             -Isdk/include -o build_mod/main.o build_mod/main.cpp
+          python3 - << 'EOF'
+          import os, re
+
+          src_path = "main.cpp" if os.path.exists("main.cpp") else ".github/workflows/main.cpp"
+          with open(src_path, "r", encoding="utf-8") as f:
+              code = f.read()
+
+          detour_h = open("sdk/include/Detour.h", "r", encoding="utf-8").read()
+          m = re.search(r"void\s*\*\s*(\w*[Ss]tub\w*)\s*;", detour_h)
+          stub_field = m.group(1) if m else "StubPtr"
+
+          code = code.replace("<cstdio>", "<stdio.h>").replace("<cstdint>", "<stdint.h>").replace("<cstdarg>", "<stdarg.h>")
+          code = re.sub(r" Notify\s*\(", "PadNotify(", code)
+          code = code.replace("NotifyStatic(buf);", "sceSysUtilSendSystemNotificationWithText(222, buf);")
+          code = code.replace(
+              "int ret = Detour_scePadReadState.Invoke<int>(handle, pData);",
+              f"typedef int (*scePadReadState_t)(int32_t, OrbisPadData*); int ret = ((scePadReadState_t)Detour_scePadReadState.{stub_field})(handle, pData);"
+          )
+          code = re.sub(
+              r"Detour_scePadReadState\.DetourFunction\s*\(\s*reinterpret_cast<uintptr_t>\(scePadReadState\)\s*,\s*reinterpret_cast<void\*>\(scePadReadState_Hook\)\s*\);",
+              "Detour_Construct(&Detour_scePadReadState); Detour_DetourFunction(&Detour_scePadReadState, reinterpret_cast<uint64_t>(scePadReadState), reinterpret_cast<void*>(scePadReadState_Hook));",
+              code
+          )
+          code = code.replace(
+              "Detour_scePadReadState.RestoreFunction();",
+              "Detour_RestoreFunction(&Detour_scePadReadState); Detour_Destroy(&Detour_scePadReadState);"
+          )
+
+          header = 'extern "C" int sceSysUtilSendSystemNotificationWithText(int messageType, const char* message);
+'
+          with open("build_mod/main.cpp", "w", encoding="utf-8") as f:
+              f.write(header + code)
+          EOF
+          clang++ --target=x86_64-pc-freebsd12-elf -fPIC -funwind-tables -fno-exceptions -fno-rtti -c             -isysroot "$OO_PS4_TOOLCHAIN"             -isystem "$OO_PS4_TOOLCHAIN/include/c++/v1"             -isystem "$OO_PS4_TOOLCHAIN/include"             -Isdk/include -o build_mod/main.o build_mod/main.cpp
           ld.lld -m elf_x86_64 -pie --script "$OO_PS4_TOOLCHAIN/link.x" --eh-frame-hdr             -o build_mod/tlou_mod.elf sdk/build/crtprx.o build_mod/main.o             -L"$OO_PS4_TOOLCHAIN/lib" -Lsdk -lGoldHEN_Hook -lc -lkernel -lScePad -lSceSysUtil
           "$OO_PS4_TOOLCHAIN/bin/create-fself" -in=build_mod/tlou_mod.elf -out=build_mod/tlou_mod.oelf --lib=output/tlou_mod.prx --paid 0x3800000000000011
           ls -lh output/tlou_mod.prx
@@ -54,5 +80,7 @@ jobs:
       - name: Upload PRX
         uses: actions/upload-artifact@v4
         with:
+          name: tlou_mod_prx
+          path: output/tlou_mod.prx
           name: tlou_mod_prx
           path: output/tlou_mod.prx
