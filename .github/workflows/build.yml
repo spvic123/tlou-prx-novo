@@ -7,7 +7,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 6
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -20,7 +20,9 @@ jobs:
       - name: Setup OpenOrbis Toolchain
         run: |
           sudo mkdir -p /opt/OpenOrbis
-          curl -sSL --retry 3 https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.2/v0.5.2.tar.gz -o toolchain.tar.gz
+          TOOLCHAIN_URL=$(curl -s https://api.github.com/repos/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/latest | grep -oE '"browser_download_url": *"[^"]+\.tar\.gz"' | head -n 1 | cut -d'"' -f4)
+          echo "Downloading: $TOOLCHAIN_URL"
+          curl -fSL --retry 3 "$TOOLCHAIN_URL" -o toolchain.tar.gz
           sudo tar -xzf toolchain.tar.gz -C /opt/OpenOrbis
           rm -f toolchain.tar.gz
           if [ ! -d "/opt/OpenOrbis/bin" ]; then
@@ -41,10 +43,11 @@ jobs:
           else
             cp .github/workflows/main.cpp "$KEEP_DIR/source/main.cpp"
           fi
+          sed -i 's/Notify(/ShowToast(/g' "$KEEP_DIR/source/main.cpp"
           if ! grep -q "lScePad" "$KEEP_DIR/Makefile"; then
             sed -i 's/-lkernel/-lkernel -lScePad/g' "$KEEP_DIR/Makefile"
           fi
-          make -C sdk
+          make -C sdk || make -C "$KEEP_DIR"
           mkdir -p output
           PRX_FILE=$(find sdk -name "*.prx" | head -n 1)
           cp "$PRX_FILE" output/tlou_mod.prx
