@@ -7,7 +7,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 8
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -15,20 +15,55 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq clang lld make git curl tar
+          sudo apt-get install -y -qq clang lld make git curl tar unzip python3
 
       - name: Setup OpenOrbis Toolchain
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           sudo mkdir -p /opt/OpenOrbis
-          TOOLCHAIN_URL=$(curl -s https://api.github.com/repos/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/latest | grep -oE '"browser_download_url": *"[^"]+\.tar\.gz"' | head -n 1 | cut -d'"' -f4)
-          echo "Downloading: $TOOLCHAIN_URL"
-          curl -fSL --retry 3 "$TOOLCHAIN_URL" -o toolchain.tar.gz
-          sudo tar -xzf toolchain.tar.gz -C /opt/OpenOrbis
-          rm -f toolchain.tar.gz
+          python3 - << 'EOF'
+          import os, json, urllib.request, subprocess
+
+          req = urllib.request.Request(
+              "https://api.github.com/repos/OpenOrbis/OpenOrbis-PS4-Toolchain/releases",
+              headers={
+                  "User-Agent": "GitHubActions",
+                  "Authorization": f"Bearer {os.environ['GH_TOKEN']}"
+              }
+          )
+          with urllib.request.urlopen(req) as resp:
+              releases = json.loads(resp.read().decode())
+
+          asset_url = None
+          asset_name = None
+          for rel in releases:
+              for a in rel.get("assets", []):
+                  name = a["name"]
+                  if name.endswith((".tar.gz", ".tgz", ".zip")):
+                      asset_url = a["browser_download_url"]
+                      asset_name = name
+                      if name.endswith((".tar.gz", ".tgz")):
+                          break
+              if asset_url:
+                  break
+
+          if not asset_url:
+              raise RuntimeError("Nenhum arquivo de toolchain encontrado nos releases!")
+
+          print(f"Baixando {asset_name} de {asset_url}...")
+          subprocess.run(["curl", "-fSL", "--retry", "3", asset_url, "-o", f"/tmp/{asset_name}"], check=True)
+          if asset_name.endswith(".zip"):
+              subprocess.run(["sudo", "unzip", "-q", f"/tmp/{asset_name}", "-d", "/opt/OpenOrbis"], check=True)
+          else:
+              subprocess.run(["sudo", "tar", "-xzf", f"/tmp/{asset_name}", "-C", "/opt/OpenOrbis"], check=True)
+          os.remove(f"/tmp/{asset_name}")
+          EOF
           if [ ! -d "/opt/OpenOrbis/bin" ]; then
-            SUBDIR=$(find /opt/OpenOrbis -maxdepth 2 -name "bin" -printf "%h\n" | head -n 1)
+            SUBDIR=$(find /opt/OpenOrbis -maxdepth 3 -name "bin" -type d -printf "%h\n" | head -n 1)
             sudo mv "$SUBDIR"/* /opt/OpenOrbis/
           fi
+          sudo chmod -R +x /opt/OpenOrbis/bin
           echo "OO_PS4_TOOLCHAIN=/opt/OpenOrbis" >> $GITHUB_ENV
 
       - name: Build Only TLOU PRX
