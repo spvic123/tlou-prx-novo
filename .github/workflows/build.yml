@@ -51,7 +51,7 @@ jobs:
           stub_field = m.group(1) if m else "StubPtr"
 
           code = code.replace("<cstdio>", "<stdio.h>").replace("<cstdint>", "<stdint.h>").replace("<cstdarg>", "<stdarg.h>")
-          code = re.sub(r" Notify\s*\(", "PadNotify(", code)
+          code = re.sub(r"\bNotify\s*\(", "PadNotify(", code)
           code = code.replace("NotifyStatic(buf);", "sceSysUtilSendSystemNotificationWithText(222, buf);")
           code = code.replace(
               "int ret = Detour_scePadReadState.Invoke<int>(handle, pData);",
@@ -67,20 +67,23 @@ jobs:
               "Detour_RestoreFunction(&Detour_scePadReadState); Detour_Destroy(&Detour_scePadReadState);"
           )
 
-          header = 'extern "C" int sceSysUtilSendSystemNotificationWithText(int messageType, const char* message);
-'
+          header = 'extern "C" int sceSysUtilSendSystemNotificationWithText(int messageType, const char* message);\n'
           with open("build_mod/main.cpp", "w", encoding="utf-8") as f:
               f.write(header + code)
           EOF
-          clang++ --target=x86_64-pc-freebsd12-elf -fPIC -funwind-tables -fno-exceptions -fno-rtti -c             -isysroot "$OO_PS4_TOOLCHAIN"             -isystem "$OO_PS4_TOOLCHAIN/include/c++/v1"             -isystem "$OO_PS4_TOOLCHAIN/include"             -Isdk/include -o build_mod/main.o build_mod/main.cpp
-          ld.lld -m elf_x86_64 -pie --script "$OO_PS4_TOOLCHAIN/link.x" --eh-frame-hdr             -o build_mod/tlou_mod.elf sdk/build/crtprx.o build_mod/main.o             -L"$OO_PS4_TOOLCHAIN/lib" -Lsdk -lGoldHEN_Hook -lc -lkernel -lScePad -lSceSysUtil
+          clang++ --target=x86_64-pc-freebsd12-elf -fPIC -funwind-tables -fno-exceptions -fno-rtti -c \
+            -isysroot "$OO_PS4_TOOLCHAIN" \
+            -isystem "$OO_PS4_TOOLCHAIN/include/c++/v1" \
+            -isystem "$OO_PS4_TOOLCHAIN/include" \
+            -Isdk/include -o build_mod/main.o build_mod/main.cpp
+          ld.lld -m elf_x86_64 -pie --script "$OO_PS4_TOOLCHAIN/link.x" --eh-frame-hdr \
+            -o build_mod/tlou_mod.elf sdk/build/crtprx.o build_mod/main.o \
+            -L"$OO_PS4_TOOLCHAIN/lib" -Lsdk -lGoldHEN_Hook -lc -lkernel -lScePad -lSceSysUtil
           "$OO_PS4_TOOLCHAIN/bin/create-fself" -in=build_mod/tlou_mod.elf -out=build_mod/tlou_mod.oelf --lib=output/tlou_mod.prx --paid 0x3800000000000011
           ls -lh output/tlou_mod.prx
 
       - name: Upload PRX
         uses: actions/upload-artifact@v4
         with:
-          name: tlou_mod_prx
-          path: output/tlou_mod.prx
           name: tlou_mod_prx
           path: output/tlou_mod.prx
