@@ -7,7 +7,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 5
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -35,36 +35,54 @@ jobs:
           with urllib.request.urlopen(req) as resp:
               releases = json.loads(resp.read().decode())
 
-          asset_url = None
-          asset_name = None
+          chosen = None
           for rel in releases:
-              for a in rel.get("assets", []):
-                  name = a["name"]
-                  if name.endswith((".tar.gz", ".tgz", ".zip")):
-                      asset_url = a["browser_download_url"]
-                      asset_name = name
-                      if name.endswith((".tar.gz", ".tgz")):
+              assets = rel.get("assets", [])
+              for a in assets:
+                  n = a["name"].lower()
+                  if "linux" in n and n.endswith((".tar.gz", ".tgz", ".zip")):
+                      chosen = a
+                      break
+              if not chosen:
+                  for a in assets:
+                      n = a["name"].lower()
+                      if not any(x in n for x in ("win", "mac", "osx", "darwin")) and n.endswith((".tar.gz", ".tgz", ".zip")):
+                          chosen = a
                           break
-              if asset_url:
+              if chosen:
                   break
 
-          if not asset_url:
-              raise RuntimeError("Nenhum arquivo de toolchain encontrado nos releases!")
+          if not chosen:
+              raise RuntimeError("Nenhum asset Linux encontrado!")
 
-          print(f"Baixando {asset_name} de {asset_url}...")
-          subprocess.run(["curl", "-fSL", "--retry", "3", asset_url, "-o", f"/tmp/{asset_name}"], check=True)
-          if asset_name.endswith(".zip"):
-              subprocess.run(["sudo", "unzip", "-q", f"/tmp/{asset_name}", "-d", "/opt/OpenOrbis"], check=True)
+          url = chosen["browser_download_url"]
+          name = chosen["name"]
+          print(f"Downloading {name}...")
+          subprocess.run(["curl", "-fSL", "--retry", "3", url, "-o", f"/tmp/{name}"], check=True)
+          if name.endswith(".zip"):
+              subprocess.run(["sudo", "unzip", "-q", f"/tmp/{name}", "-d", "/opt/OpenOrbis"], check=True)
           else:
-              subprocess.run(["sudo", "tar", "-xzf", f"/tmp/{asset_name}", "-C", "/opt/OpenOrbis"], check=True)
-          os.remove(f"/tmp/{asset_name}")
+              subprocess.run(["sudo", "tar", "-xzf", f"/tmp/{name}", "-C", "/opt/OpenOrbis"], check=True)
+          os.remove(f"/tmp/{name}")
           EOF
-          if [ ! -d "/opt/OpenOrbis/bin" ]; then
-            SUBDIR=$(find /opt/OpenOrbis -maxdepth 3 -name "bin" -type d -printf "%h\n" | head -n 1)
-            sudo mv "$SUBDIR"/* /opt/OpenOrbis/
+
+          FSELF=$(find /opt/OpenOrbis -name "create-fself" -type f | head -n 1)
+          if [ -z "$FSELF" ]; then
+            echo "ERRO: create-fself nao encontrado!"
+            find /opt/OpenOrbis -maxdepth 4
+            exit 1
           fi
-          sudo chmod -R +x /opt/OpenOrbis/bin
-          echo "OO_PS4_TOOLCHAIN=/opt/OpenOrbis" >> $GITHUB_ENV
+          BIN_DIR=$(dirname "$FSELF")
+          ROOT_DIR=$(dirname "$BIN_DIR")
+          if [ ! -d "$ROOT_DIR/include" ]; then
+            ROOT_DIR=$(dirname "$ROOT_DIR")
+          fi
+          if [ "$BIN_DIR" != "$ROOT_DIR/bin" ]; then
+            sudo mkdir -p "$ROOT_DIR/bin"
+            sudo cp -f "$BIN_DIR"/* "$ROOT_DIR/bin/"
+          fi
+          sudo chmod -R +x "$ROOT_DIR/bin"
+          echo "OO_PS4_TOOLCHAIN=$ROOT_DIR" >> $GITHUB_ENV
 
       - name: Build Only TLOU PRX
         run: |
@@ -78,11 +96,10 @@ jobs:
           else
             cp .github/workflows/main.cpp "$KEEP_DIR/source/main.cpp"
           fi
-          sed -i 's/Notify(/ShowToast(/g' "$KEEP_DIR/source/main.cpp"
           if ! grep -q "lScePad" "$KEEP_DIR/Makefile"; then
             sed -i 's/-lkernel/-lkernel -lScePad/g' "$KEEP_DIR/Makefile"
           fi
-          make -C sdk || make -C "$KEEP_DIR"
+          make -C sdk
           mkdir -p output
           PRX_FILE=$(find sdk -name "*.prx" | head -n 1)
           cp "$PRX_FILE" output/tlou_mod.prx
