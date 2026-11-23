@@ -49,6 +49,8 @@ jobs:
           detour_h = open("sdk/include/Detour.h", "r", encoding="utf-8").read()
           m = re.search(r"void\s*\*\s*(\w*[Ss]tub\w*)\s*;", detour_h)
           stub_field = m.group(1) if m else "StubPtr"
+          m_mode = re.search(r"\b(DetourMode_\w*64\w*)\b", detour_h)
+          detour_mode = m_mode.group(1) if m_mode else "static_cast<DetourMode>(1)"
 
           code = code.replace("<cstdio>", "<stdio.h>").replace("<cstdint>", "<stdint.h>").replace("<cstdarg>", "<stdarg.h>")
           code = re.sub(r"\bNotify\s*\(", "PadNotify(", code)
@@ -59,7 +61,7 @@ jobs:
           )
           code = re.sub(
               r"Detour_scePadReadState\.DetourFunction\s*\(\s*reinterpret_cast<uintptr_t>\(scePadReadState\)\s*,\s*reinterpret_cast<void\*>\(scePadReadState_Hook\)\s*\);",
-              "Detour_Construct(&Detour_scePadReadState); Detour_DetourFunction(&Detour_scePadReadState, reinterpret_cast<uint64_t>(scePadReadState), reinterpret_cast<void*>(scePadReadState_Hook));",
+              f"Detour_Construct(&Detour_scePadReadState, {detour_mode}); Detour_DetourFunction(&Detour_scePadReadState, reinterpret_cast<uint64_t>(scePadReadState), reinterpret_cast<void*>(scePadReadState_Hook));",
               code
           )
           code = code.replace(
