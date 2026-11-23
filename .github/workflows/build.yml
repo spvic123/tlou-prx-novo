@@ -1,0 +1,52 @@
+name: Build TLOU PRX
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld make git curl tar
+
+      - name: Setup OpenOrbis Toolchain
+        run: |
+          sudo mkdir -p /opt/OpenOrbis
+          curl -sSL --retry 3 https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.2/v0.5.2.tar.gz -o toolchain.tar.gz
+          sudo tar -xzf toolchain.tar.gz -C /opt/OpenOrbis
+          rm -f toolchain.tar.gz
+          if [ ! -d "/opt/OpenOrbis/bin" ]; then
+            SUBDIR=$(find /opt/OpenOrbis -maxdepth 2 -name "bin" -printf "%h\n" | head -n 1)
+            sudo mv "$SUBDIR"/* /opt/OpenOrbis/
+          fi
+          echo "OO_PS4_TOOLCHAIN=/opt/OpenOrbis" >> $GITHUB_ENV
+
+      - name: Build Only TLOU PRX
+        run: |
+          git clone --depth 1 --recursive https://github.com/GoldHEN/GoldHEN_Plugins_SDK.git sdk
+          KEEP_DIR=$(find sdk/plugin_src -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          KEEP_NAME=$(basename "$KEEP_DIR")
+          find sdk/plugin_src -mindepth 1 -maxdepth 1 -type d ! -name "$KEEP_NAME" -exec rm -rf {} +
+          rm -f "$KEEP_DIR/source/"*.cpp
+          cp main.cpp "$KEEP_DIR/source/main.cpp"
+          if ! grep -q "lScePad" "$KEEP_DIR/Makefile"; then
+            sed -i 's/-lkernel/-lkernel -lScePad/g' "$KEEP_DIR/Makefile"
+          fi
+          make -C sdk
+          mkdir -p output
+          PRX_FILE=$(find sdk -name "*.prx" | head -n 1)
+          cp "$PRX_FILE" output/tlou_mod.prx
+
+      - name: Upload PRX
+        uses: actions/upload-artifact@v4
+        with:
+          name: tlou_mod_prx
+          path: output/tlou_mod.prx
