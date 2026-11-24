@@ -1,59 +1,320 @@
-name: Build TLOU PRX
+#include <Common.h>
+#include <orbis/libkernel.h>
+#include <orbis/Pad.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <stdarg.h>
+#include <string.h>
 
-on:
-  push:
-  workflow_dispatch:
+bool g_MenuOpen = false;
+int  g_Cursor   = 0;
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+struct WeaponProfile {
+    const char* name;
+    uint32_t    rapidStep;
+    int         defaultRecoilY;
+    int         recoilY;
+};
 
-      - name: Install build tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq clang llvm lld make git curl tar unzip python3
+WeaponProfile g_Profiles[] = {
+    { "Rajada (Burst)",  2, 14, 14 },
+    { "Rifle Variavel",  2, 10, 10 },
+    { "Semi-Auto",       3,  8,  8 },
+    { "9mm / Revolver",  2,  6,  6 },
+    { "Anti-Recoil 0",   2,  0,  0 }
+};
 
-      - name: Setup OpenOrbis Toolchain
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          sudo mkdir -p /opt/OpenOrbis
-          python3 -c 'import os,json,urllib.request,subprocess; req=urllib.request.Request("https://api.github.com/repos/OpenOrbis/OpenOrbis-PS4-Toolchain/releases",headers={"User-Agent":"GA","Authorization":"Bearer "+os.environ["GH_TOKEN"]}); rels=json.loads(urllib.request.urlopen(req).read()); assets=[a for r in rels for a in r.get("assets",[]) if a["name"].lower().endswith((".tar.gz",".tgz",".zip"))]; linux=[a for a in assets if "linux" in a["name"].lower()] or [a for a in assets if not any(x in a["name"].lower() for x in ("win","mac","osx","darwin"))]; a=linux[0]; p="/tmp/"+a["name"]; subprocess.run(["curl","-fSL","--retry","3",a["browser_download_url"],"-o",p],check=True); subprocess.run(["sudo","unzip","-q",p,"-d","/opt/OpenOrbis"] if p.endswith(".zip") else ["sudo","tar","-xzf",p,"-C","/opt/OpenOrbis"],check=True); os.remove(p)'
-          FSELF=$(find /opt/OpenOrbis -name "create-fself" -type f | head -n 1)
-          BIN_DIR=$(dirname "$FSELF")
-          ROOT_DIR=$(dirname "$BIN_DIR")
-          [ ! -d "$ROOT_DIR/include" ] && ROOT_DIR=$(dirname "$ROOT_DIR")
-          if [ "$BIN_DIR" != "$ROOT_DIR/bin" ]; then
-            sudo mkdir -p "$ROOT_DIR/bin"
-            sudo cp -f "$BIN_DIR"/* "$ROOT_DIR/bin/"
-          fi
-          sudo chmod -R +x "$ROOT_DIR/bin"
-          echo "OO_PS4_TOOLCHAIN=$ROOT_DIR" >> $GITHUB_ENV
+constexpr int NUM_PROFILES = 5;
+int g_CurrentProfile = 0;
 
-      - name: Build Only TLOU PRX
-        run: |
-          git clone --depth 1 --recursive https://github.com/GoldHEN/GoldHEN_Plugins_SDK.git sdk
-          make -C sdk
-          mkdir -p build_mod output
-          SRC_FILE="main.cpp"
-          [ ! -f "$SRC_FILE" ] && SRC_FILE=".github/workflows/main.cpp"
-          clang++ --target=x86_64-pc-freebsd12-elf -fPIC -funwind-tables -fno-exceptions -fno-rtti -c \
-            -isysroot "$OO_PS4_TOOLCHAIN" \
-            -isystem "$OO_PS4_TOOLCHAIN/include/c++/v1" \
-            -isystem "$OO_PS4_TOOLCHAIN/include" \
-            -Isdk/include -o build_mod/main.o "$SRC_FILE"
-          ld.lld -m elf_x86_64 -shared --allow-multiple-definition --script "$OO_PS4_TOOLCHAIN/link.x" --eh-frame-hdr \
-            -o build_mod/tlou_mod.elf sdk/build/crtprx.o build_mod/main.o \
-            -L"$OO_PS4_TOOLCHAIN/lib" -Lsdk -lGoldHEN_Hook -lc -lkernel
-          "$OO_PS4_TOOLCHAIN/bin/create-fself" -in=build_mod/tlou_mod.elf -out=build_mod/tlou_mod.oelf --lib=output/tlou_mod.prx --paid 0x3800000000000011
-          ls -lh output/tlou_mod.prx
+struct PadMods {
+    bool useL1R1    = false; // false = L2+R2 | true = L1+R1
+    bool rapidFire  = true;
+    bool stickyAim  = true;
+    bool autoMarkR3 = true;
+} g_Mods;
 
-      - name: Upload PRX
-        uses: actions/upload-artifact@v4
-        with:
-          name: tlou_mod_prx
-          path: output/tlou_mod.prx
+constexpr int MENU_ITEMS = 6;
+
+uint32_t g_FrameCounter = 0;
+uint32_t g_PrevButtons  = 0;
+
+constexpr int      STICKY_AIM_STRENGTH = 4;
+constexpr uint32_t AUTO_MARK_INTERVAL  = 25;
+constexpr uint32_t AUTO_MARK_HOLD      = 3;
+
+typedef int (*scePadRead_t)(int32_t, OrbisPadData*, int32_t);
+scePadRead_t  g_OrigScePadRead = nullptr;
+uint64_t*     g_GotSlot        = nullptr;
+volatile bool g_Running        = true;
+
+void PadNotify(const char* fmt, ...) {
+    OrbisNotificationRequest req = {};
+    req.targetId = -1;
+    req.userId = -1;
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(req.message, sizeof(req.message), fmt, args);
+    va_end(args);
+    sceKernelSendNotificationRequest(0, &req, sizeof(req), 0);
+}
+
+uint8_t ClampStick(int value) {
+    if (value < 0) return 0;
+    if (value > 255) return 255;
+    return static_cast<uint8_t>(value);
+}
+
+void ShowCurrentOptionStatus() {
+    WeaponProfile& wp = g_Profiles[g_CurrentProfile];
+    switch (g_Cursor) {
+        case 0: PadNotify("Arma: %s (Recuo: %d)", wp.name, wp.recoilY); break;
+        case 1: PadNotify("Anti-Recoil Y: %d [Esq/Dir | X=Zerar]", wp.recoilY); break;
+        case 2: PadNotify("Rapid Fire: %s", g_Mods.rapidFire ? "ON" : "OFF"); break;
+        case 3: PadNotify("Assistencia Mira: %s", g_Mods.stickyAim ? "ON" : "OFF"); break;
+        case 4: PadNotify("Auto Marcar R3: %s", g_Mods.autoMarkR3 ? "ON" : "OFF"); break;
+        case 5: PadNotify("Layout: %s", g_Mods.useL1R1 ? "L1 + R1" : "L2 + R2"); break;
+    }
+}
+
+void AdjustCurrentOption(int dir) {
+    WeaponProfile& wp = g_Profiles[g_CurrentProfile];
+    switch (g_Cursor) {
+        case 0:
+            g_CurrentProfile = (g_CurrentProfile + dir + NUM_PROFILES) % NUM_PROFILES;
+            PadNotify("Arma: %s (Recuo: %d)", g_Profiles[g_CurrentProfile].name, g_Profiles[g_CurrentProfile].recoilY);
+            break;
+        case 1:
+            if (dir == 0) {
+                wp.recoilY = 0;
+                PadNotify("Anti-Recoil ZERADO (0) [%s]", wp.name);
+            } else {
+                wp.recoilY += dir;
+                if (wp.recoilY < 0) wp.recoilY = 0;
+                if (wp.recoilY > 40) wp.recoilY = 40;
+                PadNotify("Anti-Recoil Y: %d [%s]", wp.recoilY, wp.name);
+            }
+            break;
+        case 2:
+            g_Mods.rapidFire = !g_Mods.rapidFire;
+            PadNotify("Rapid Fire: %s", g_Mods.rapidFire ? "ON" : "OFF");
+            break;
+        case 3:
+            g_Mods.stickyAim = !g_Mods.stickyAim;
+            PadNotify("Assistencia Mira: %s", g_Mods.stickyAim ? "ON" : "OFF");
+            break;
+        case 4:
+            g_Mods.autoMarkR3 = !g_Mods.autoMarkR3;
+            PadNotify("Auto Marcar R3: %s", g_Mods.autoMarkR3 ? "ON" : "OFF");
+            break;
+        case 5:
+            g_Mods.useL1R1 = !g_Mods.useL1R1;
+            PadNotify("Layout: %s", g_Mods.useL1R1 ? "L1 + R1" : "L2 + R2");
+            break;
+    }
+}
+
+void ProcessPadPackets(OrbisPadData* pData, int count) {
+    g_FrameCounter++;
+    OrbisPadData& latest = pData[count - 1];
+    uint32_t btn = latest.buttons;
+    uint32_t newlyPressed = btn & ~g_PrevButtons;
+
+    bool toggleCombo = ((btn & ORBIS_PAD_BUTTON_SQUARE) && (newlyPressed & ORBIS_PAD_BUTTON_RIGHT)) ||
+                       ((btn & ORBIS_PAD_BUTTON_RIGHT) && (newlyPressed & ORBIS_PAD_BUTTON_SQUARE));
+
+    if (toggleCombo) {
+        g_MenuOpen = !g_MenuOpen;
+        if (g_MenuOpen) {
+            PadNotify("Menu Aberto [Cima/Baixo | Esq/Dir | X]");
+            ShowCurrentOptionStatus();
+        } else {
+            PadNotify("Menu Fechado");
+        }
+    }
+
+    if (!g_MenuOpen && !toggleCombo && (btn & ORBIS_PAD_BUTTON_SQUARE)) {
+        if (newlyPressed & ORBIS_PAD_BUTTON_LEFT) {
+            g_CurrentProfile = (g_CurrentProfile + 1) % NUM_PROFILES;
+            PadNotify("Arma: %s | Recuo: %d", g_Profiles[g_CurrentProfile].name, g_Profiles[g_CurrentProfile].recoilY);
+        }
+        if (newlyPressed & ORBIS_PAD_BUTTON_DOWN) {
+            WeaponProfile& wp = g_Profiles[g_CurrentProfile];
+            if (wp.recoilY != 0) {
+                wp.recoilY = 0;
+                PadNotify("Anti-Recoil ZERADO (0) [%s]", wp.name);
+            } else {
+                wp.recoilY = wp.defaultRecoilY;
+                PadNotify("Anti-Recoil Restaurado: %d [%s]", wp.recoilY, wp.name);
+            }
+        }
+    }
+
+    if (g_MenuOpen && !toggleCombo) {
+        if (newlyPressed & ORBIS_PAD_BUTTON_UP) {
+            g_Cursor = (g_Cursor - 1 + MENU_ITEMS) % MENU_ITEMS;
+            ShowCurrentOptionStatus();
+        }
+        if (newlyPressed & ORBIS_PAD_BUTTON_DOWN) {
+            g_Cursor = (g_Cursor + 1) % MENU_ITEMS;
+            ShowCurrentOptionStatus();
+        }
+        if (newlyPressed & ORBIS_PAD_BUTTON_LEFT) {
+            AdjustCurrentOption(-1);
+        }
+        if (newlyPressed & ORBIS_PAD_BUTTON_RIGHT) {
+            AdjustCurrentOption(1);
+        }
+        if (newlyPressed & ORBIS_PAD_BUTTON_CROSS) {
+            AdjustCurrentOption(g_Cursor == 1 ? 0 : 1);
+        }
+    }
+
+    g_PrevButtons = btn;
+
+    WeaponProfile& activeWp = g_Profiles[g_CurrentProfile];
+    uint32_t aimBtn  = g_Mods.useL1R1 ? ORBIS_PAD_BUTTON_L1 : ORBIS_PAD_BUTTON_L2;
+    uint32_t fireBtn = g_Mods.useL1R1 ? ORBIS_PAD_BUTTON_R1 : ORBIS_PAD_BUTTON_R2;
+
+    bool isAiming = (btn & aimBtn) != 0;
+    bool isFiring = (btn & fireBtn) != 0;
+
+    uint32_t step = activeWp.rapidStep > 0 ? activeWp.rapidStep : 2;
+    bool releasePulse = ((g_FrameCounter / step) % 2) == 1;
+
+    int stickOffsetX = 0;
+    int stickOffsetY = 0;
+
+    if (g_Mods.stickyAim && isAiming) {
+        int phase = g_FrameCounter % 4;
+        if (isFiring) {
+            stickOffsetX = (phase % 2 == 0) ? STICKY_AIM_STRENGTH : -STICKY_AIM_STRENGTH;
+        } else {
+            if (phase == 0)      { stickOffsetX =  STICKY_AIM_STRENGTH; }
+            else if (phase == 1) { stickOffsetY =  STICKY_AIM_STRENGTH; }
+            else if (phase == 2) { stickOffsetX = -STICKY_AIM_STRENGTH; }
+            else                 { stickOffsetY = -STICKY_AIM_STRENGTH; }
+        }
+    }
+
+    if (isAiming && isFiring && activeWp.recoilY > 0) {
+        stickOffsetY += activeWp.recoilY;
+    }
+
+    bool doMark = g_Mods.autoMarkR3 && isAiming && ((g_FrameCounter % AUTO_MARK_INTERVAL) < AUTO_MARK_HOLD);
+
+    for (int i = 0; i < count; i++) {
+        OrbisPadData& pkt = pData[i];
+
+        if (toggleCombo) {
+            pkt.buttons &= ~ORBIS_PAD_BUTTON_RIGHT;
+        }
+        if (!g_MenuOpen && (btn & ORBIS_PAD_BUTTON_SQUARE)) {
+            pkt.buttons &= ~(ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_DOWN);
+        }
+        if (g_MenuOpen) {
+            pkt.buttons &= ~(ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN | ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS);
+        }
+
+        if (g_Mods.rapidFire && isFiring) {
+            if (releasePulse) {
+                pkt.buttons &= ~fireBtn;
+                if (!g_Mods.useL1R1) pkt.analogButtons.r2 = 0;
+            } else {
+                pkt.buttons |= fireBtn;
+                if (!g_Mods.useL1R1) pkt.analogButtons.r2 = 255;
+            }
+        }
+
+        if (stickOffsetX != 0 || stickOffsetY != 0) {
+            pkt.rightStick.x = ClampStick(static_cast<int>(pkt.rightStick.x) + stickOffsetX);
+            pkt.rightStick.y = ClampStick(static_cast<int>(pkt.rightStick.y) + stickOffsetY);
+        }
+
+        if (doMark) {
+            pkt.buttons |= ORBIS_PAD_BUTTON_R3;
+        }
+    }
+}
+
+int scePadRead_Hook(int32_t handle, OrbisPadData* pData, int32_t num) {
+    if (!g_OrigScePadRead) return -1;
+    int ret = g_OrigScePadRead(handle, pData, num);
+    if (ret > 0 && pData != nullptr) {
+        ProcessPadPackets(pData, ret);
+    }
+    return ret;
+}
+
+void* InstallGotHookThread(void*) {
+    int padHandle = sceKernelLoadStartModule("libScePad.sprx", 0, nullptr, 0, nullptr, nullptr);
+    if (padHandle < 0) {
+        PadNotify("TLOU PRX: Erro libScePad");
+        return nullptr;
+    }
+
+    void* fnRead = nullptr;
+    if (sceKernelDlsym(padHandle, "scePadRead", &fnRead) < 0 || fnRead == nullptr) {
+        PadNotify("TLOU PRX: Erro dlsym scePadRead");
+        return nullptr;
+    }
+
+    uint64_t targetAddr = reinterpret_cast<uint64_t>(fnRead);
+    uint64_t hookAddr   = reinterpret_cast<uint64_t>(scePadRead_Hook);
+
+    OrbisKernelModule handles[64] = {};
+    size_t numHandles = 0;
+    if (sceKernelGetModuleList(handles, 64, &numHandles) < 0 || numHandles == 0) {
+        PadNotify("TLOU PRX: Erro ModuleList");
+        return nullptr;
+    }
+
+    OrbisKernelModuleInfo modInfo;
+    memset(&modInfo, 0, sizeof(modInfo));
+    modInfo.size = sizeof(modInfo);
+    if (sceKernelGetModuleInfo(handles[0], &modInfo) < 0) {
+        PadNotify("TLOU PRX: Erro ModuleInfo");
+        return nullptr;
+    }
+
+    for (int attempt = 0; attempt < 25 && g_Running; attempt++) {
+        for (uint32_t s = 0; s < modInfo.segmentCount; s++) {
+            if ((modInfo.segmentInfo[s].prot & 0x2) == 0) continue;
+            uint64_t* start = reinterpret_cast<uint64_t*>(modInfo.segmentInfo[s].address);
+            size_t qwords = modInfo.segmentInfo[s].size / sizeof(uint64_t);
+            for (size_t i = 0; i < qwords; i++) {
+                if (start[i] == targetAddr) {
+                    g_OrigScePadRead = reinterpret_cast<scePadRead_t>(fnRead);
+                    if (__sync_bool_compare_and_swap(&start[i], targetAddr, hookAddr)) {
+                        g_GotSlot = &start[i];
+                        PadNotify("TLOU PRX Ativo! [Quad+Dir Menu | Quad+Esq Arma]");
+                        return nullptr;
+                    }
+                }
+            }
+        }
+        usleep(400000);
+    }
+
+    PadNotify("TLOU PRX: Import scePadRead nao encontrado");
+    return nullptr;
+}
+
+extern "C" __attribute__((visibility("default"))) int module_start(size_t argc, const void* argv) {
+    pthread_t tid;
+    pthread_create(&tid, nullptr, InstallGotHookThread, nullptr);
+    pthread_detach(tid);
+    return 0;
+}
+
+extern "C" __attribute__((visibility("default"))) int module_stop(size_t argc, const void* argv) {
+    g_Running = false;
+    if (g_GotSlot != nullptr && g_OrigScePadRead != nullptr) {
+        uint64_t hookAddr = reinterpret_cast<uint64_t>(scePadRead_Hook);
+        uint64_t origAddr = reinterpret_cast<uint64_t>(g_OrigScePadRead);
+        __sync_bool_compare_and_swap(g_GotSlot, hookAddr, origAddr);
+    }
+    return 0;
+}
