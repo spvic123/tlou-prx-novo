@@ -1,4 +1,4 @@
- name: Build TLOU PRX
+name: Build TLOU PRX
 
 on:
   push:
