@@ -1,8 +1,5 @@
-#include <Common.h>
 #include <orbis/libkernel.h>
 #include <orbis/Pad.h>
-#include <pthread.h>
-#include <unistd.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdarg.h>
@@ -249,6 +246,8 @@ int scePadRead_Hook(int32_t handle, OrbisPadData* pData, int32_t num) {
 }
 
 void* InstallGotHookThread(void*) {
+    sceKernelSleep(3);
+
     int padHandle = sceKernelLoadStartModule("libScePad.sprx", 0, nullptr, 0, nullptr, nullptr);
     if (padHandle < 0) {
         PadNotify("TLOU PRX: Erro libScePad");
@@ -271,10 +270,23 @@ void* InstallGotHookThread(void*) {
         return nullptr;
     }
 
+    OrbisKernelModule ebootHandle = handles[0];
+    for (size_t m = 0; m < numHandles; m++) {
+        OrbisKernelModuleInfo info;
+        memset(&info, 0, sizeof(info));
+        info.size = sizeof(info);
+        if (sceKernelGetModuleInfo(handles[m], &info) >= 0) {
+            if (strstr(info.name, "eboot") != nullptr) {
+                ebootHandle = handles[m];
+                break;
+            }
+        }
+    }
+
     OrbisKernelModuleInfo modInfo;
     memset(&modInfo, 0, sizeof(modInfo));
     modInfo.size = sizeof(modInfo);
-    if (sceKernelGetModuleInfo(handles[0], &modInfo) < 0) {
+    if (sceKernelGetModuleInfo(ebootHandle, &modInfo) < 0) {
         PadNotify("TLOU PRX: Erro ModuleInfo");
         return nullptr;
     }
@@ -282,6 +294,7 @@ void* InstallGotHookThread(void*) {
     for (int attempt = 0; attempt < 25 && g_Running; attempt++) {
         for (uint32_t s = 0; s < modInfo.segmentCount; s++) {
             if ((modInfo.segmentInfo[s].prot & 0x2) == 0) continue;
+            if (modInfo.segmentInfo[s].address == nullptr || modInfo.segmentInfo[s].size < 8) continue;
             uint64_t* start = reinterpret_cast<uint64_t*>(modInfo.segmentInfo[s].address);
             size_t qwords = modInfo.segmentInfo[s].size / sizeof(uint64_t);
             for (size_t i = 0; i < qwords; i++) {
@@ -295,7 +308,7 @@ void* InstallGotHookThread(void*) {
                 }
             }
         }
-        usleep(400000);
+        sceKernelUsleep(400000);
     }
 
     PadNotify("TLOU PRX: Import scePadRead nao encontrado");
@@ -303,9 +316,10 @@ void* InstallGotHookThread(void*) {
 }
 
 extern "C" __attribute__((visibility("default"))) int module_start(size_t argc, const void* argv) {
-    pthread_t tid;
-    pthread_create(&tid, nullptr, InstallGotHookThread, nullptr);
-    pthread_detach(tid);
+    OrbisPthread tid;
+    if (scePthreadCreate(&tid, nullptr, InstallGotHookThread, nullptr, "tlou_hook") == 0) {
+        scePthreadDetach(tid);
+    }
     return 0;
 }
 
