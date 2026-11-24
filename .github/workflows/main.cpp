@@ -1,9 +1,12 @@
 #include <Common.h>
 #include <orbis/libkernel.h>
 #include <orbis/Pad.h>
+#include <pthread.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <string.h>
 
 bool g_MenuOpen = false;
 int  g_Cursor   = 0;
@@ -42,8 +45,10 @@ constexpr int      STICKY_AIM_STRENGTH = 4;
 constexpr uint32_t AUTO_MARK_INTERVAL  = 25;
 constexpr uint32_t AUTO_MARK_HOLD      = 3;
 
-Detour Detour_scePadReadState;
-Detour Detour_scePadRead;
+typedef int (*scePadRead_t)(int32_t, OrbisPadData*, int32_t);
+scePadRead_t  g_OrigScePadRead = nullptr;
+uint64_t*     g_GotSlot        = nullptr;
+volatile bool g_Running        = true;
 
 void PadNotify(const char* fmt, ...) {
     OrbisNotificationRequest req = {};
@@ -111,12 +116,12 @@ void AdjustCurrentOption(int dir) {
     }
 }
 
-void ProcessPadData(OrbisPadData* pData) {
+void ProcessPadPackets(OrbisPadData* pData, int count) {
     g_FrameCounter++;
-    uint32_t btn = pData->buttons;
+    OrbisPadData& latest = pData[count - 1];
+    uint32_t btn = latest.buttons;
     uint32_t newlyPressed = btn & ~g_PrevButtons;
 
-    // Quadrado + Direita (em qualquer ordem): Abre ou fecha o menu
     bool toggleCombo = ((btn & ORBIS_PAD_BUTTON_SQUARE) && (newlyPressed & ORBIS_PAD_BUTTON_RIGHT)) ||
                        ((btn & ORBIS_PAD_BUTTON_RIGHT) && (newlyPressed & ORBIS_PAD_BUTTON_SQUARE));
 
@@ -128,15 +133,12 @@ void ProcessPadData(OrbisPadData* pData) {
         } else {
             PadNotify("Menu Fechado");
         }
-        pData->buttons &= ~ORBIS_PAD_BUTTON_RIGHT;
     }
 
-    // Atalhos rapidos fora do menu (segurando Quadrado)
     if (!g_MenuOpen && !toggleCombo && (btn & ORBIS_PAD_BUTTON_SQUARE)) {
         if (newlyPressed & ORBIS_PAD_BUTTON_LEFT) {
             g_CurrentProfile = (g_CurrentProfile + 1) % NUM_PROFILES;
             PadNotify("Arma: %s | Recuo: %d", g_Profiles[g_CurrentProfile].name, g_Profiles[g_CurrentProfile].recoilY);
-            pData->buttons &= ~ORBIS_PAD_BUTTON_LEFT;
         }
         if (newlyPressed & ORBIS_PAD_BUTTON_DOWN) {
             WeaponProfile& wp = g_Profiles[g_CurrentProfile];
@@ -147,7 +149,6 @@ void ProcessPadData(OrbisPadData* pData) {
                 wp.recoilY = wp.defaultRecoilY;
                 PadNotify("Anti-Recoil Restaurado: %d [%s]", wp.recoilY, wp.name);
             }
-            pData->buttons &= ~ORBIS_PAD_BUTTON_DOWN;
         }
     }
 
@@ -169,7 +170,6 @@ void ProcessPadData(OrbisPadData* pData) {
         if (newlyPressed & ORBIS_PAD_BUTTON_CROSS) {
             AdjustCurrentOption(g_Cursor == 1 ? 0 : 1);
         }
-        pData->buttons &= ~(ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN | ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS);
     }
 
     g_PrevButtons = btn;
@@ -181,17 +181,8 @@ void ProcessPadData(OrbisPadData* pData) {
     bool isAiming = (btn & aimBtn) != 0;
     bool isFiring = (btn & fireBtn) != 0;
 
-    if (g_Mods.rapidFire && isFiring) {
-        uint32_t step = activeWp.rapidStep > 0 ? activeWp.rapidStep : 2;
-        bool releasePulse = ((g_FrameCounter / step) % 2) == 1;
-        if (releasePulse) {
-            pData->buttons &= ~fireBtn;
-            if (!g_Mods.useL1R1) pData->analogButtons.r2 = 0;
-        } else {
-            pData->buttons |= fireBtn;
-            if (!g_Mods.useL1R1) pData->analogButtons.r2 = 255;
-        }
-    }
+    uint32_t step = activeWp.rapidStep > 0 ? activeWp.rapidStep : 2;
+    bool releasePulse = ((g_FrameCounter / step) % 2) == 1;
 
     int stickOffsetX = 0;
     int stickOffsetY = 0;
@@ -212,69 +203,118 @@ void ProcessPadData(OrbisPadData* pData) {
         stickOffsetY += activeWp.recoilY;
     }
 
-    if (stickOffsetX != 0 || stickOffsetY != 0) {
-        pData->rightStick.x = ClampStick(static_cast<int>(pData->rightStick.x) + stickOffsetX);
-        pData->rightStick.y = ClampStick(static_cast<int>(pData->rightStick.y) + stickOffsetY);
-    }
+    bool doMark = g_Mods.autoMarkR3 && isAiming && ((g_FrameCounter % AUTO_MARK_INTERVAL) < AUTO_MARK_HOLD);
 
-    if (g_Mods.autoMarkR3 && isAiming) {
-        if ((g_FrameCounter % AUTO_MARK_INTERVAL) < AUTO_MARK_HOLD) {
-            pData->buttons |= ORBIS_PAD_BUTTON_R3;
+    for (int i = 0; i < count; i++) {
+        OrbisPadData& pkt = pData[i];
+
+        if (toggleCombo) {
+            pkt.buttons &= ~ORBIS_PAD_BUTTON_RIGHT;
+        }
+        if (!g_MenuOpen && (btn & ORBIS_PAD_BUTTON_SQUARE)) {
+            pkt.buttons &= ~(ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_DOWN);
+        }
+        if (g_MenuOpen) {
+            pkt.buttons &= ~(ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN | ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS);
+        }
+
+        if (g_Mods.rapidFire && isFiring) {
+            if (releasePulse) {
+                pkt.buttons &= ~fireBtn;
+                if (!g_Mods.useL1R1) pkt.analogButtons.r2 = 0;
+            } else {
+                pkt.buttons |= fireBtn;
+                if (!g_Mods.useL1R1) pkt.analogButtons.r2 = 255;
+            }
+        }
+
+        if (stickOffsetX != 0 || stickOffsetY != 0) {
+            pkt.rightStick.x = ClampStick(static_cast<int>(pkt.rightStick.x) + stickOffsetX);
+            pkt.rightStick.y = ClampStick(static_cast<int>(pkt.rightStick.y) + stickOffsetY);
+        }
+
+        if (doMark) {
+            pkt.buttons |= ORBIS_PAD_BUTTON_R3;
         }
     }
-}
-
-int scePadReadState_Hook(int32_t handle, OrbisPadData* pData) {
-    typedef int (*scePadReadState_t)(int32_t, OrbisPadData*);
-    scePadReadState_t origFn = reinterpret_cast<scePadReadState_t>(Detour_scePadReadState.StubPtr);
-    if (!origFn) return -1;
-    int ret = origFn(handle, pData);
-    if (ret == 0 && pData != nullptr) {
-        ProcessPadData(pData);
-    }
-    return ret;
 }
 
 int scePadRead_Hook(int32_t handle, OrbisPadData* pData, int32_t num) {
-    typedef int (*scePadRead_t)(int32_t, OrbisPadData*, int32_t);
-    scePadRead_t origFn = reinterpret_cast<scePadRead_t>(Detour_scePadRead.StubPtr);
-    if (!origFn) return -1;
-    int ret = origFn(handle, pData, num);
+    if (!g_OrigScePadRead) return -1;
+    int ret = g_OrigScePadRead(handle, pData, num);
     if (ret > 0 && pData != nullptr) {
-        ProcessPadData(&pData[0]);
+        ProcessPadPackets(pData, ret);
     }
     return ret;
 }
 
-extern "C" __attribute__((visibility("default"))) int module_start(size_t argc, const void* argv) {
-    int hooksCount = 0;
+void* InstallGotHookThread(void*) {
     int padHandle = sceKernelLoadStartModule("libScePad.sprx", 0, nullptr, 0, nullptr, nullptr);
-    if (padHandle >= 0) {
-        void* fnReadState = nullptr;
-        if (sceKernelDlsym(padHandle, "scePadReadState", &fnReadState) >= 0 && fnReadState != nullptr) {
-            Detour_Construct(&Detour_scePadReadState, static_cast<DetourMode>(1));
-            Detour_DetourFunction(&Detour_scePadReadState, reinterpret_cast<uint64_t>(fnReadState), reinterpret_cast<void*>(scePadReadState_Hook));
-            hooksCount++;
-        }
-        void* fnRead = nullptr;
-        if (sceKernelDlsym(padHandle, "scePadRead", &fnRead) >= 0 && fnRead != nullptr) {
-            Detour_Construct(&Detour_scePadRead, static_cast<DetourMode>(1));
-            Detour_DetourFunction(&Detour_scePadRead, reinterpret_cast<uint64_t>(fnRead), reinterpret_cast<void*>(scePadRead_Hook));
-            hooksCount++;
-        }
+    if (padHandle < 0) {
+        PadNotify("TLOU PRX: Erro libScePad");
+        return nullptr;
     }
-    PadNotify("TLOU PRX v2 Carregado! [Hooks: %d]", hooksCount);
+
+    void* fnRead = nullptr;
+    if (sceKernelDlsym(padHandle, "scePadRead", &fnRead) < 0 || fnRead == nullptr) {
+        PadNotify("TLOU PRX: Erro dlsym scePadRead");
+        return nullptr;
+    }
+
+    uint64_t targetAddr = reinterpret_cast<uint64_t>(fnRead);
+    uint64_t hookAddr   = reinterpret_cast<uint64_t>(scePadRead_Hook);
+
+    int handles[64] = {};
+    size_t numHandles = 0;
+    if (sceKernelGetModuleList(handles, 64, &numHandles) < 0 || numHandles == 0) {
+        PadNotify("TLOU PRX: Erro ModuleList");
+        return nullptr;
+    }
+
+    OrbisKernelModuleInfo modInfo;
+    memset(&modInfo, 0, sizeof(modInfo));
+    modInfo.size = sizeof(modInfo);
+    if (sceKernelGetModuleInfo(handles[0], &modInfo) < 0) {
+        PadNotify("TLOU PRX: Erro ModuleInfo");
+        return nullptr;
+    }
+
+    for (int attempt = 0; attempt < 25 && g_Running; attempt++) {
+        for (uint32_t s = 0; s < modInfo.segmentCount; s++) {
+            if ((modInfo.segmentInfo[s].prot & 0x2) == 0) continue;
+            uint64_t* start = reinterpret_cast<uint64_t*>(modInfo.segmentInfo[s].address);
+            size_t qwords = modInfo.segmentInfo[s].size / sizeof(uint64_t);
+            for (size_t i = 0; i < qwords; i++) {
+                if (start[i] == targetAddr) {
+                    g_OrigScePadRead = reinterpret_cast<scePadRead_t>(fnRead);
+                    if (__sync_bool_compare_and_swap(&start[i], targetAddr, hookAddr)) {
+                        g_GotSlot = &start[i];
+                        PadNotify("TLOU PRX Ativo! [Quad+Dir Menu | Quad+Esq Arma]");
+                        return nullptr;
+                    }
+                }
+            }
+        }
+        usleep(400000);
+    }
+
+    PadNotify("TLOU PRX: Import scePadRead nao encontrado");
+    return nullptr;
+}
+
+extern "C" __attribute__((visibility("default"))) int module_start(size_t argc, const void* argv) {
+    pthread_t tid;
+    pthread_create(&tid, nullptr, InstallGotHookThread, nullptr);
+    pthread_detach(tid);
     return 0;
 }
 
 extern "C" __attribute__((visibility("default"))) int module_stop(size_t argc, const void* argv) {
-    if (Detour_scePadReadState.StubPtr != nullptr) {
-        Detour_RestoreFunction(&Detour_scePadReadState);
-        Detour_Destroy(&Detour_scePadReadState);
-    }
-    if (Detour_scePadRead.StubPtr != nullptr) {
-        Detour_RestoreFunction(&Detour_scePadRead);
-        Detour_Destroy(&Detour_scePadRead);
+    g_Running = false;
+    if (g_GotSlot != nullptr && g_OrigScePadRead != nullptr) {
+        uint64_t hookAddr = reinterpret_cast<uint64_t>(scePadRead_Hook);
+        uint64_t origAddr = reinterpret_cast<uint64_t>(g_OrigScePadRead);
+        __sync_bool_compare_and_swap(g_GotSlot, hookAddr, origAddr);
     }
     return 0;
 }
