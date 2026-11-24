@@ -264,7 +264,7 @@ void* InstallGotHookThread(void*) {
     uint64_t targetAddr = reinterpret_cast<uint64_t>(fnRead);
     uint64_t hookAddr   = reinterpret_cast<uint64_t>(scePadRead_Hook);
 
-    int handles[64] = {};
+    OrbisKernelModule handles[64] = {};
     size_t numHandles = 0;
     if (sceKernelGetModuleList(handles, 64, &numHandles) < 0 || numHandles == 0) {
         PadNotify("TLOU PRX: Erro ModuleList");
