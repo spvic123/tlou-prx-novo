@@ -39,77 +39,13 @@ jobs:
           git clone --depth 1 --recursive https://github.com/GoldHEN/GoldHEN_Plugins_SDK.git sdk
           make -C sdk
           mkdir -p build_mod output
-          python3 - << 'EOF'
-          import os, re
-
-          src_path = "main.cpp" if os.path.exists("main.cpp") else ".github/workflows/main.cpp"
-          with open(src_path, "r", encoding="utf-8") as f:
-              code = f.read()
-
-          detour_h = open("sdk/include/Detour.h", "r", encoding="utf-8").read()
-          m = re.search(r"void\s*\*\s*(\w*[Ss]tub\w*)\s*;", detour_h)
-          stub_field = m.group(1) if m else "StubPtr"
-          m_mode = re.search(r"\b(DetourMode_\w*64\w*)\b", detour_h)
-          detour_mode = m_mode.group(1) if m_mode else "static_cast<DetourMode>(1)"
-
-          code = code.replace("<cstdio>", "<stdio.h>").replace("<cstdint>", "<stdint.h>").replace("<cstdarg>", "<stdarg.h>")
-          code = re.sub(r"\bNotify\s*\(", "PadNotify(", code)
-
-          old_notify = re.search(r"void\s+PadNotify\s*\([^)]*\)\s*\{.*?\n\}", code, flags=re.S)
-          safe_notify = '''void PadNotify(const char* fmt, ...) {
-              OrbisNotificationRequest req = {};
-              req.targetId = -1;
-              req.userId = -1;
-              va_list args;
-              va_start(args, fmt);
-              vsnprintf(req.message, sizeof(req.message), fmt, args);
-              va_end(args);
-              sceKernelSendNotificationRequest(0, &req, sizeof(req), 0);
-          }'''
-          if old_notify:
-              code = code[:old_notify.start()] + safe_notify + code[old_notify.end():]
-
-          code = code.replace(
-              "int ret = Detour_scePadReadState.Invoke<int>(handle, pData);",
-              f"typedef int (*scePadReadState_t)(int32_t, OrbisPadData*); scePadReadState_t origFn = reinterpret_cast<scePadReadState_t>(Detour_scePadReadState.{stub_field}); if (!origFn) return -1; int ret = origFn(handle, pData);"
-          )
-
-          resolver_helper = '''uint64_t ResolvePadReadState() {
-              int handle = sceKernelLoadStartModule("libScePad.sprx", 0, nullptr, 0, nullptr, nullptr);
-              if (handle < 0) {
-                  handle = sceKernelLoadStartModule("/system/common/lib/libScePad.sprx", 0, nullptr, 0, nullptr, nullptr);
-              }
-              if (handle < 0) return 0;
-              void* fnAddr = nullptr;
-              if (sceKernelDlsym(handle, "scePadReadState", &fnAddr) < 0 || fnAddr == nullptr) return 0;
-              return reinterpret_cast<uint64_t>(fnAddr);
-          }
-
-          '''
-          code = re.sub(
-              r'extern "C" __attribute__\(\(visibility\("default"\)\)\) int module_start',
-              resolver_helper + 'extern "C" __attribute__((visibility("default"))) int module_start',
-              code
-          )
-
-          code = re.sub(
-              r"Detour_scePadReadState\.DetourFunction\s*\(\s*reinterpret_cast<uintptr_t>\(scePadReadState\)\s*,\s*reinterpret_cast<void\*>\(scePadReadState_Hook\)\s*\);",
-              f"uint64_t padFn = ResolvePadReadState(); if (padFn != 0) {{ Detour_Construct(&Detour_scePadReadState, {detour_mode}); Detour_DetourFunction(&Detour_scePadReadState, padFn, reinterpret_cast<void*>(scePadReadState_Hook)); }}",
-              code
-          )
-          code = code.replace(
-              "Detour_scePadReadState.RestoreFunction();",
-              f"if (Detour_scePadReadState.{stub_field} != nullptr) {{ Detour_RestoreFunction(&Detour_scePadReadState); Detour_Destroy(&Detour_scePadReadState); }}"
-          )
-
-          with open("build_mod/main.cpp", "w", encoding="utf-8") as f:
-              f.write(code)
-          EOF
+          SRC_FILE="main.cpp"
+          [ ! -f "$SRC_FILE" ] && SRC_FILE=".github/workflows/main.cpp"
           clang++ --target=x86_64-pc-freebsd12-elf -fPIC -funwind-tables -fno-exceptions -fno-rtti -c \
             -isysroot "$OO_PS4_TOOLCHAIN" \
             -isystem "$OO_PS4_TOOLCHAIN/include/c++/v1" \
             -isystem "$OO_PS4_TOOLCHAIN/include" \
-            -Isdk/include -o build_mod/main.o build_mod/main.cpp
+            -Isdk/include -o build_mod/main.o "$SRC_FILE"
           ld.lld -m elf_x86_64 -shared --allow-multiple-definition --script "$OO_PS4_TOOLCHAIN/link.x" --eh-frame-hdr \
             -o build_mod/tlou_mod.elf sdk/build/crtprx.o build_mod/main.o \
             -L"$OO_PS4_TOOLCHAIN/lib" -Lsdk -lGoldHEN_Hook -lc -lkernel
