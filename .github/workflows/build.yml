@@ -56,26 +56,7 @@ jobs:
           code = re.sub(r"\bNotify\s*\(", "PadNotify(", code)
 
           old_notify = re.search(r"void\s+PadNotify\s*\([^)]*\)\s*\{.*?\n\}", code, flags=re.S)
-          safe_notify = '''struct OrbisNotificationRequest {
-              int type;
-              int reqId;
-              int priority;
-              int msgType;
-              int targetId;
-              int userId;
-              int unk1;
-              int unk2;
-              int appId;
-              int errorNum;
-              int unk3;
-              unsigned char useIconImageUri;
-              char message[1024];
-              char iconUri[1024];
-              char unk[1024];
-          };
-          extern "C" int sceKernelSendNotificationRequest(int device, OrbisNotificationRequest* req, size_t size, int blocking);
-
-          void PadNotify(const char* fmt, ...) {
+          safe_notify = '''void PadNotify(const char* fmt, ...) {
               OrbisNotificationRequest req = {};
               req.targetId = -1;
               req.userId = -1;
@@ -90,7 +71,7 @@ jobs:
 
           code = code.replace(
               "int ret = Detour_scePadReadState.Invoke<int>(handle, pData);",
-              f"typedef int (*scePadReadState_t)(int32_t, OrbisPadData*); int ret = ((scePadReadState_t)Detour_scePadReadState.{stub_field})(handle, pData);"
+              f"typedef int (*scePadReadState_t)(int32_t, OrbisPadData*); scePadReadState_t origFn = reinterpret_cast<scePadReadState_t>(Detour_scePadReadState.{stub_field}); if (!origFn) return -1; int ret = origFn(handle, pData);"
           )
 
           resolver_helper = '''uint64_t ResolvePadReadState() {
@@ -129,7 +110,7 @@ jobs:
             -isystem "$OO_PS4_TOOLCHAIN/include/c++/v1" \
             -isystem "$OO_PS4_TOOLCHAIN/include" \
             -Isdk/include -o build_mod/main.o build_mod/main.cpp
-          ld.lld -m elf_x86_64 -shared --script "$OO_PS4_TOOLCHAIN/link.x" --eh-frame-hdr \
+          ld.lld -m elf_x86_64 -shared --allow-multiple-definition --script "$OO_PS4_TOOLCHAIN/link.x" --eh-frame-hdr \
             -o build_mod/tlou_mod.elf sdk/build/crtprx.o build_mod/main.o \
             -L"$OO_PS4_TOOLCHAIN/lib" -Lsdk -lGoldHEN_Hook -lc -lkernel
           "$OO_PS4_TOOLCHAIN/bin/create-fself" -in=build_mod/tlou_mod.elf -out=build_mod/tlou_mod.oelf --lib=output/tlou_mod.prx --paid 0x3800000000000011
